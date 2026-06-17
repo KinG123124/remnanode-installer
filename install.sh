@@ -3,7 +3,7 @@
 set -e
 
 if [ "$EUID" -ne 0 ]; then
-  echo "❌ Ошибка: Пожалуйста, запустите этот скрипт через sudo (sudo ./install_remnanode.sh)"
+  echo "❌ Ошибка: Пожалуйста, запустите этот скрипт через sudo"
   exit 1
 fi
 
@@ -82,5 +82,31 @@ echo "⚡ Запуск контейнера Remnanode..."
 docker compose up -d
 
 echo "------------------------------------------------------"
-echo "🎉 Всё готово! Сервис успешно настроен и запущен в фоне."
-echo "👉 Проверить статус ноды можно командой: cd /opt/remnanode && docker compose ps"
+
+read -p "Хотите установить скрипт автоматической настройки selfsteal? [y/N]: " CONFIRM_STEAL
+if [[ "$CONFIRM_STEAL" =~ ^[Yy]$ ]]; then
+  echo "⏳ Скачивание и запуск selfsteal..."
+  curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh -o /tmp/selfsteal.sh
+  bash /tmp/selfsteal.sh @ --nginx install
+  rm -f /tmp/selfsteal.sh
+  echo "✅ Настройка selfsteal завершена."
+else
+  echo "⏭️ Установка selfsteal пропущена."
+fi
+
+echo "------------------------------------------------------"
+
+read -p "Хотите установить скрипт автоматической настройки Cloudflare WARP? [y/N]: " CONFIRM_WARP
+if [[ "$CONFIRM_WARP" =~ ^[Yy]$ ]]; then
+  echo "⏳ Скачивание и запуск Cloudflare WARP..."
+  curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh -o /tmp/warp_install.sh
+  bash /tmp/warp_install.sh
+  rm -f /tmp/warp_install.sh
+  echo "✅ Настройка Cloudflare WARP завершена."
+else
+  echo "⏭️ Установка Cloudflare WARP пропущена."
+fi
+
+echo "------------------------------------------------------"
+echo "🎉 Все выбранные этапы успешно выполнены!"
+echo "👉 Проверить статус ноды: cd /opt/remnanode && docker compose ps"
