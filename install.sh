@@ -429,7 +429,7 @@ services:
   remnanode:
     container_name: remnanode
     hostname: remnanode
-    image: remnawave/node:latest
+    image: remnawave/node:2.8.0
     network_mode: host
     restart: always
     cap_add:
