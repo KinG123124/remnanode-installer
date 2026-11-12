@@ -1,138 +1,112 @@
 #!/usr/bin/env bash
-# RemnaNode standalone installer — no third-party Bash installers are downloaded/executed.
-# Target: Ubuntu / Debian, Docker Compose v2, Remnawave Node.
-# Supports: Node, Nginx Reality fallback, TLS for Hysteria2/XHTTP,
-# optional staged SNI edge, diagnosis, rollback. Review before running.
+# rw-ins — single-file RemnaNode maintenance CLI, preview 0.2.0
+# Ubuntu/Debian, bash 4.4+, systemd. Does not execute third-party Bash installers.
 set -Eeuo pipefail
 umask 077
 
-VERSION='0.1.0-preview'
+VERSION='0.2.0-preview'
+SELF='/usr/local/bin/rw-ins'
+SELF_URL='https://raw.githubusercontent.com/KinG123124/remnanode-installer/refs/heads/main/install.sh'
+STATE='/etc/rw-ins'
 NODE_DIR='/opt/remnanode'
-SITE_DIR='/var/www/remna-selfsteal'
-NGINX_SITE='/etc/nginx/sites-available/remna-selfsteal.conf'
-NGINX_LINK='/etc/nginx/sites-enabled/remna-selfsteal.conf'
-EDGE_DIR='/etc/nginx/remna-stream'
-EDGE_ACTIVE="$EDGE_DIR/sni-edge.conf"
-EDGE_PENDING="$EDGE_DIR/sni-edge.pending"
-EDGE_STATE='/etc/remna-installer/edge.env'
-CERT_COPY='/etc/xray-certs/hy2'
-DOM_FILE='/etc/remna-installer/domain'
-BACKUP_DIR='/var/backups/remna-installer'
+NODE_IMAGE='remnawave/node:2.8.0'  # intentionally pinned; never update implicitly
+SITE='/var/www/rw-ins-site'
+WEBROOT='/var/www/rw-ins-acme'
+DOMAIN_FILE="$STATE/domain"
+CONF='/etc/nginx/sites-available/rw-ins-site.conf'
+CONF_LINK='/etc/nginx/sites-enabled/rw-ins-site.conf'
+EDGE_FILE='/etc/nginx/conf.d/rw-ins-edge.disabled' # staging is not loaded by nginx
+EDGE_ACTIVE='/etc/nginx/rw-ins-edge.conf'
+CERT_DEST='/etc/xray-certs/hy2'
+HOOK='/etc/letsencrypt/renewal-hooks/deploy/rw-ins-sync'
+FW_CONF="$STATE/api-firewall.conf"
+FW_UNIT='/etc/systemd/system/rw-ins-api-firewall.service'
+FW_C4='RWINSAPI4'
+FW_C6='RWINSAPI6'
+FW_TAG='rw-ins-node-api'
+BACKUPS='/var/backups/rw-ins'
 
-log()  { printf '\033[1;34m[i]\033[0m %s\n' "$*"; }
-ok()   { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+info(){ printf '\033[34m[i]\033[0m %s\n' "$*"; }
+ok(){ printf '\033[32m[+]\033[0m %s\n' "$*"; }
+warn(){ printf '\033[33m[!]\033[0m %s\n' "$*" >&2; }
+die(){ printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "Не найдена команда $1"; }
+ask(){ local v; printf '%s' "$1" >/dev/tty; IFS= read -r v </dev/tty || return 1; REPLY="$v"; }
+secret_ask(){ local v; printf '%s' "$1" >/dev/tty; IFS= read -rs v </dev/tty || return 1; printf '\n' >/dev/tty; REPLY="$v"; }
+yesno(){ ask "$1 [y/N]: "; [[ "${REPLY,,}" == 'y' || "${REPLY,,}" == 'yes' || "${REPLY,,}" == 'д' ]]; }
+valid_domain(){ [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ && ${#1} -le 253 ]]; }
+valid_ipv4(){ local ip="$1" i; [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1; local -a nums; IFS=. read -ra nums <<< "$ip"; for i in "${nums[@]}"; do [[ $i =~ ^[0-9]{1,3}$ ]] && (( 10#$i <= 255 )) || return 1; done; [[ $ip != 0.0.0.0 && $ip != 255.255.255.255 ]]; }
+valid_port(){ [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+root_only(){ (( EUID == 0 )) || die 'Запусти с sudo/root'; [[ -r /dev/tty ]] || [[ "${1:-}" == 'noninteractive' ]] || die 'Для меню нужен интерактивный терминал'; }
+base_os(){ local ID VERSION VERSION_CODENAME PRETTY_NAME; [[ -r /etc/os-release ]] || die 'Нужен Ubuntu/Debian'; . /etc/os-release; [[ $ID == ubuntu || $ID == debian ]] || die 'Поддерживаются Ubuntu/Debian'; }
+init(){ root_only noninteractive; base_os; mkdir -p "$STATE" "$BACKUPS"; chmod 700 "$STATE" "$BACKUPS"; }
+backup(){ local p="$1" sub; [[ -e "$p" || -L "$p" ]] || return 0; sub="$BACKUPS/$(date +%Y%m%d-%H%M%S)-$$"; mkdir -p "$sub"; cp -a "$p" "$sub/"; info "Резервная копия: $sub/$(basename "$p")"; }
+apt_install(){ export DEBIAN_FRONTEND=noninteractive; apt-get update -qq; apt-get install -y "$@"; }
 
-error_handler() { warn "Ошибка на строке $1 (код $2). Проверь сообщения выше. Существующие файлы не удалены."; }
-trap 'error_handler "$LINENO" "$?"' ERR
-
-ask() {
-  local label="$1" reply
-  if [[ -r /dev/tty ]]; then
-    printf '%s' "$label" >/dev/tty
-    IFS= read -r reply </dev/tty || return 1
+# bash -c "$(curl ...)" has no source pathname, but Bash exposes its command text.
+# This saves exactly the code that is currently running, not a newer upstream version.
+install_self(){
+  init
+  local candidate='' tmp
+  tmp="$(mktemp "$STATE/self.XXXXXXXX")"
+  if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    candidate="${BASH_SOURCE[0]}"
+    cp "$candidate" "$tmp"
+  elif [[ -n "${BASH_EXECUTION_STRING:-}" ]]; then
+    printf '%s\n' "$BASH_EXECUTION_STRING" > "$tmp"
   else
-    printf '%s' "$label" >&2
-    IFS= read -r reply || return 1
+    rm -f "$tmp"
+    die 'Не удалось определить исходный код. Используй: sudo bash /path/to/install.sh'
   fi
-  REPLY="$reply"
+  if ! bash -n "$tmp"; then rm -f "$tmp"; die 'Ошибка синтаксиса исходного скрипта'; fi
+  if [[ -f "$SELF" ]] && cmp -s "$tmp" "$SELF"; then rm -f "$tmp"; return; fi
+  [[ -e "$SELF" ]] && backup "$SELF"
+  install -m 0755 "$tmp" "$SELF"
+  rm -f "$tmp"
+  ok "Команда rw-ins установлена: $SELF"
 }
-ask_secret() {
-  local label="$1" reply
-  [[ -r /dev/tty ]] || die 'Для ввода секретного ключа нужен интерактивный терминал.'
-  printf '%s' "$label" >/dev/tty
-  IFS= read -rs reply </dev/tty || return 1
-  printf '\n' >/dev/tty
-  REPLY="$reply"
-}
-confirm() { ask "$1 [y/N]: "; [[ "${REPLY,,}" == 'y' || "${REPLY,,}" == 'yes' || "${REPLY,,}" == 'д' ]]; }
-root_only() { [[ $EUID -eq 0 ]] || die 'Нужен root: sudo bash install.sh'; }
-need() { command -v "$1" >/dev/null 2>&1 || die "Не найдена команда: $1"; }
-valid_domain() {
-  local d="${1,,}"
-  [[ ${#d} -le 253 && $d =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]
-}
-valid_ipv4() {
-  local ip="$1" octet
-  [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  IFS='.' read -r -a parts <<< "$ip"
-  for octet in "${parts[@]}"; do (( 10#$octet >= 0 && 10#$octet <= 255 )) || return 1; done
-}
-backup_file() {
-  local src="$1" stamp
-  [[ -e "$src" ]] || return 0
-  stamp="$(date +%Y%m%d-%H%M%S)"
-  mkdir -p "$BACKUP_DIR/$stamp"
-  cp -a -- "$src" "$BACKUP_DIR/$stamp/$(basename "$src")"
-  log "Резервная копия: $BACKUP_DIR/$stamp/$(basename "$src")"
-}
-preflight() {
-  root_only
-  [[ -f /etc/os-release ]] || die 'Не найдена /etc/os-release'
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  [[ "${ID:-}" == 'ubuntu' || "${ID:-}" == 'debian' ]] || die 'Поддерживаются только Ubuntu/Debian.'
-  need apt-get; need systemctl; need openssl; need ss; need ip
-  mkdir -p /etc/remna-installer "$BACKUP_DIR"
-  chmod 700 /etc/remna-installer
-}
-install_packages() {
-  local -a packages=("$@")
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y "${packages[@]}"
-}
-ensure_docker() {
+
+ensure_docker(){
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    ok 'Docker и Compose v2 уже доступны'
-    return 0
+    systemctl is-active --quiet docker || systemctl start docker
+    ok 'Docker + Compose уже установлены'; return
   fi
-  log 'Устанавливаю Docker из пакетных репозиториев (без curl | bash)'
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  local compose_package=''
-  if apt-cache show docker-compose-v2 >/dev/null 2>&1; then compose_package='docker-compose-v2'
-  elif apt-cache show docker-compose-plugin >/dev/null 2>&1; then compose_package='docker-compose-plugin'
-  fi
-  if [[ -n "$compose_package" ]]; then
-    apt-get install -y docker.io "$compose_package"
+  info 'Устанавливаю Docker и Compose. Существующие контейнеры не удаляются.'
+  apt_install ca-certificates curl gnupg
+  if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
+    apt_install docker.io docker-compose-v2
+  elif apt-cache show docker-compose-plugin >/dev/null 2>&1 && apt-cache show docker.io >/dev/null 2>&1; then
+    apt_install docker.io docker-compose-plugin
   else
-    # Official Docker apt repository; verifies signature through apt's signed-by keyring.
-    apt-get install -y ca-certificates curl gnupg
+    # Official Docker apt repository; apt verifies its signed repository metadata.
+    local ID VERSION VERSION_CODENAME PRETTY_NAME
+    . /etc/os-release
     install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL "https://download.docker.com/linux/$(. /etc/os-release; echo "$ID")/gpg" \
-      | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    curl -fsSL "https://download.docker.com/linux/$ID/gpg" | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
-    # shellcheck disable=SC1091
-    source /etc/os-release
     local arch codename
     arch="$(dpkg --print-architecture)"; codename="${VERSION_CODENAME:-}"
-    [[ -n "$codename" ]] || die 'Не удалось определить codename ОС.'
-    printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/%s %s stable\n' \
-      "$arch" "$ID" "$codename" > /etc/apt/sources.list.d/docker-ce.list
-    apt-get update -qq
-    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    [[ -n "$codename" ]] || die 'Не определён codename ОС'
+    printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/%s %s stable\n' "$arch" "$ID" "$codename" > /etc/apt/sources.list.d/docker-ce.list
+    apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   fi
   systemctl enable --now docker
-  docker compose version >/dev/null 2>&1 || die 'Docker Compose v2 не установлен.'
+  docker compose version >/dev/null 2>&1 || die 'Docker Compose недоступен'
 }
-install_node() {
-  preflight
+
+node_exists(){
+  [[ -f "$NODE_DIR/docker-compose.yml" || -f "$NODE_DIR/compose.yaml" ]] && return 0
+  command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq remnanode
+}
+install_node(){
   ensure_docker
-  if [[ -e "$NODE_DIR/docker-compose.yml" || -e "$NODE_DIR/compose.yaml" ]]; then
-    warn "Найден существующий Compose в $NODE_DIR. Не перезаписываю его."
-    return 0
-  fi
-  ask_secret 'Вставь SECRET_KEY ноды из панели Remnawave: '
-  local secret="$REPLY"
-  [[ -n "$secret" && "$secret" != *$'\n'* && "$secret" != *$'\r'* ]] || die 'Недопустимый SECRET_KEY'
-  # Prevent dotenv injection. Keys from Remnawave are URL-safe strings.
-  [[ "$secret" =~ ^[A-Za-z0-9._=-]+$ ]] || die 'SECRET_KEY содержит необычные символы; используй Compose, выданный панелью.'
-  ask 'NODE_PORT [2222]: '
-  local port="${REPLY:-2222}"
-  [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( port >= 1 && port <= 65535 )) || die 'Недопустимый порт'
-  mkdir -p "$NODE_DIR" "$CERT_COPY"
+  if node_exists; then ok 'RemnaNode уже обнаружена — не перезаписываю Compose и .env'; return; fi
+  secret_ask 'SECRET_KEY из панели Remnawave: '
+  local secret="$REPLY" port
+  [[ -n "$secret" && "$secret" =~ ^[A-Za-z0-9._+/=-]+$ ]] || die 'Некорректный SECRET_KEY: нужны символы base64/URL-safe, без пробелов и переносов'
+  ask 'NODE_PORT [2222]: '; port="${REPLY:-2222}"
+  valid_port "$port" || die 'Некорректный порт'
+  mkdir -p "$NODE_DIR" "$CERT_DEST"
   chmod 700 "$NODE_DIR"
   printf 'SECRET_KEY=%s\n' "$secret" > "$NODE_DIR/.env"
   chmod 600 "$NODE_DIR/.env"
@@ -140,7 +114,7 @@ install_node() {
   cat > "$NODE_DIR/docker-compose.yml" <<YAML
 services:
   remnanode:
-    image: remnawave/node:latest
+    image: $NODE_IMAGE
     container_name: remnanode
     hostname: remnanode
     restart: unless-stopped
@@ -151,7 +125,7 @@ services:
       NODE_PORT: "$port"
     volumes:
       - /dev/shm:/dev/shm
-      - $CERT_COPY:$CERT_COPY:ro
+      - $CERT_DEST:$CERT_DEST:ro
     cap_add:
       - NET_ADMIN
     ulimits:
@@ -160,320 +134,486 @@ services:
         hard: 65535
 YAML
   chmod 600 "$NODE_DIR/docker-compose.yml"
-  ( cd "$NODE_DIR" && docker compose config --quiet && docker compose up -d )
-  ok 'RemnaNode запущена. Назначь Config Profile в панели.'
-  warn 'Проверяй, что rw-core может прочитать приватный ключ TLS внутри контейнера: docker exec remnanode test -r /etc/xray-certs/hy2/privkey.pem'
-  warn "Порт $port пока публичный. Закрой его по IP панели ПОСЛЕ переезда панели."
-  warn 'Если профиль содержит XHTTP/Hysteria2, сначала настрой TLS-сертификат.'
+  (cd "$NODE_DIR" && docker compose config -q)
+  info 'Рекомендуется закрыть NODE_PORT до запуска ноды.'
+  if yesno 'Ограничить NODE_PORT доступом только с публичного IPv4 панели?'; then
+    local panel_ip
+    ask 'Публичный IPv4 панели: '; panel_ip="$REPLY"
+    valid_ipv4 "$panel_ip" || die 'Некорректный IP панели — нода пока не запущена'
+    command -v iptables >/dev/null 2>&1 && command -v ip6tables >/dev/null 2>&1 || apt_install iptables
+    fw_apply "$panel_ip" "$port"
+    fw_persist
+    ok "API порта $port ограничен IP панели ещё до запуска ноды"
+  else
+    warn "NODE_PORT $port останется публичным до выполнения пункта защиты API в меню."
+  fi
+  (cd "$NODE_DIR" && docker compose up -d)
+  ok "RemnaNode ($NODE_IMAGE) запущена на NODE_PORT $port"
+  warn 'Назначь Config Profile в панели и проверь соединение с нодой.'
 }
 
-ensure_certificate() {
-  local domain="$1" email="$2" certdir="/etc/letsencrypt/live/$domain"
-  if [[ -s "$certdir/fullchain.pem" && -s "$certdir/privkey.pem" ]]; then
-    ok "Сертификат уже есть: $certdir"
-    return 0
+node_port(){
+  if [[ -f "$FW_CONF" ]]; then . "$FW_CONF"; printf '%s' "$PORT"; return; fi
+  # Detect when possible; avoid reading a user's SECRET_KEY from docker compose.
+  if command -v docker >/dev/null 2>&1; then
+    local p
+    p="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' remnanode 2>/dev/null | sed -n 's/^NODE_PORT=//p' | head -1 || true)"
+    if valid_port "$p"; then printf '%s' "$p"; return; fi
   fi
-  if ss -H -ltn '( sport = :80 )' | grep -q .; then
-    die 'Порт TCP/80 занят. Для HTTP-01 нужен свободный порт; действующие веб-сервисы автоматически не останавливаю.'
-  fi
-  install_packages certbot ca-certificates
-  log "Certbot HTTP-01 для $domain. DNS A-запись должна вести на этот сервер, TCP/80 открыт."
-  certbot certonly --standalone --preferred-challenges http --non-interactive --agree-tos \
-    --email "$email" --keep-until-expiring --key-type ecdsa -d "$domain"
-  [[ -s "$certdir/fullchain.pem" ]] || die 'Сертификат не создан.'
+  printf '2222'
 }
 
-write_cert_hook() {
-  local domain="$1"
-  local hook='/etc/letsencrypt/renewal-hooks/deploy/remna-sync.sh'
-  mkdir -p "$(dirname "$hook")"
-  cat > "$hook" <<'HOOK'
+ensure_nginx(){
+  command -v nginx >/dev/null 2>&1 || apt_install nginx libnginx-mod-stream
+  if [[ ! -f /usr/lib/nginx/modules/ngx_stream_module.so ]] && ! nginx -V 2>&1 | grep -q -- '--with-stream=static'; then
+    # On Debian/Ubuntu the dynamic stream module is packaged separately.
+    apt_install libnginx-mod-stream
+  fi
+  if ! nginx -V 2>&1 | grep -Eq '(--with-stream_ssl_preread_module|--with-stream_ssl_preread_module=dynamic)'; then
+    warn 'Модуль ssl_preread не подтверждён; перед активацией проверь nginx -t.'
+  fi
+}
+
+write_webroot(){
+  local d="$1"
+  mkdir -p "$WEBROOT/.well-known/acme-challenge" "$SITE" /etc/nginx/sites-available /etc/nginx/sites-enabled
+  if [[ -e "$CONF" ]]; then backup "$CONF"; fi
+  cat > "$CONF" <<NG
+# Generated by rw-ins $VERSION; only for $d.
+server {
+  listen 80;
+  listen [::]:80;
+  server_name $d;
+  location ^~ /.well-known/acme-challenge/ { root $WEBROOT; default_type text/plain; }
+  location / { return 301 https://\$host\$request_uri; }
+}
+NG
+  ln -sfn "$CONF" "$CONF_LINK"
+  nginx -t
+  systemctl enable --now nginx
+  systemctl reload nginx
+}
+
+ensure_certbot(){ command -v certbot >/dev/null 2>&1 || apt_install certbot ca-certificates; }
+issue_cert(){
+  local d="$1" email="$2" lineage="/etc/letsencrypt/live/$d"
+  ensure_certbot
+  if [[ -s "$lineage/fullchain.pem" && -s "$lineage/privkey.pem" ]]; then
+    ok "Уже есть сертификат для $d"
+    local renewal="/etc/letsencrypt/renewal/$d.conf"
+    if [[ -f "$renewal" ]] && grep -Eq '^authenticator\s*=\s*standalone' "$renewal"; then
+      warn "Старый сертификат $d использует standalone. Его автопродление может конфликтовать с Nginx на 80 порту."
+      if yesno 'Попробовать certbot reconfigure (webroot), проверив тестовое продление?'; then
+        certbot reconfigure --cert-name "$d" --authenticator webroot --webroot-path "$WEBROOT" --non-interactive || warn 'Не удалось переписать renewal. Проверь certbot renew --dry-run.'
+      fi
+    fi
+    return
+  fi
+  info "Получаю сертификат для $d через HTTP-01 webroot. DNS домена должен указывать на эту ноду, TCP/80 открыт."
+  certbot certonly --webroot -w "$WEBROOT" --non-interactive --agree-tos --email "$email" --key-type ecdsa -d "$d"
+  [[ -r "$lineage/fullchain.pem" && -r "$lineage/privkey.pem" ]] || die 'Certbot не выпустил сертификат'
+}
+
+write_hook(){
+  mkdir -p "$(dirname "$HOOK")"
+  cat > "$HOOK" <<'HOOK_BODY'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-[[ -s /etc/remna-installer/domain ]] || exit 0
-domain="$(cat /etc/remna-installer/domain)"
-certdir="/etc/letsencrypt/live/$domain"
-[[ -r "$certdir/fullchain.pem" && -r "$certdir/privkey.pem" ]] || exit 0
-# On deploy hook, act only for selected certificate, unless run manually without RENEWED_LINEAGE.
-if [[ -n "${RENEWED_LINEAGE:-}" && "${RENEWED_LINEAGE%/}" != "$certdir" ]]; then exit 0; fi
+[[ -r /etc/rw-ins/domain ]] || exit 0
+domain="$(cat /etc/rw-ins/domain)"
+src="/etc/letsencrypt/live/$domain"
+[[ -r "$src/fullchain.pem" && -r "$src/privkey.pem" ]] || exit 0
+[[ -z "${RENEWED_LINEAGE:-}" || "${RENEWED_LINEAGE%/}" == "$src" ]] || exit 0
 out=/etc/xray-certs/hy2
 mkdir -p "$out"
 changed=0
-if ! cmp -s "$certdir/fullchain.pem" "$out/fullchain.pem"; then
-  install -m 0644 "$certdir/fullchain.pem" "$out/fullchain.pem"
-  changed=1
+if ! cmp -s "$src/fullchain.pem" "$out/fullchain.pem"; then
+  install -m 0644 "$src/fullchain.pem" "$out/fullchain.pem"; changed=1
 fi
-if ! cmp -s "$certdir/privkey.pem" "$out/privkey.pem"; then
-  install -m 0600 "$certdir/privkey.pem" "$out/privkey.pem"
-  changed=1
+if ! cmp -s "$src/privkey.pem" "$out/privkey.pem"; then
+  install -m 0600 "$src/privkey.pem" "$out/privkey.pem"; changed=1
 fi
 if (( changed )); then
   systemctl is-active --quiet nginx && systemctl reload nginx || true
-  if command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -Fxq remnanode; then
+  if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -Fxq remnanode; then
     docker restart remnanode >/dev/null
   fi
 fi
-HOOK
-  chmod 700 "$hook"
-  # Also sync now. Certbot's deploy hook only runs when the certificate is obtained/renewed.
-  "$hook"
-  systemctl enable --now certbot.timer >/dev/null 2>&1 || warn 'Проверь certbot.timer.'
+HOOK_BODY
+  chmod 700 "$HOOK"
+  "$HOOK"
+  systemctl enable --now certbot.timer 2>/dev/null || warn 'Не удалось включить certbot.timer'
 }
 
-install_selfsteal() {
-  preflight
-  if command -v docker >/dev/null && docker ps -a --format '{{.Names}}' | grep -Fxq nginx-selfsteal; then
-    die 'Обнаружен nginx-selfsteal в Docker. Автоматическую миграцию не делаю во избежание конфликтов Unix-сокета.'
+selfsteal(){
+  if command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' | grep -Fxq nginx-selfsteal; then
+    die 'Есть существующий контейнер nginx-selfsteal. Автоматически его не заменяю: возможен конфликт сокета. На старых нодах используйте только пункт firewall.'
   fi
-  ask 'Домен текущей ноды, например de.veloragrid.site: '
-  local domain="${REPLY,,}"
-  valid_domain "$domain" || die 'Некорректный домен'
-  ask 'Email для Let’s Encrypt: '
-  local email="$REPLY"
-  [[ "$email" == *@*.* && "$email" != *' '* ]] || die 'Некорректный email'
-  local oldconf=""
-  if [[ -e "$NGINX_SITE" ]]; then
-    warn "Конфигурация $NGINX_SITE уже существует."
-    confirm 'Перезаписать её с резервной копией?' || return 0
-    backup_file "$NGINX_SITE"
-    oldconf="$(mktemp /tmp/remna-selfsteal-old.XXXXXX)"
-    cp -a "$NGINX_SITE" "$oldconf"
-  fi
-  # Certificate obtained before Nginx, to avoid monopolizing TCP/80 during first issuance.
-  ensure_certificate "$domain" "$email"
-  install_packages nginx libnginx-mod-stream
-  mkdir -p "$SITE_DIR" /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/remna-installer
-  printf '%s\n' "$domain" > "$DOM_FILE"; chmod 600 "$DOM_FILE"
-  cat > "$SITE_DIR/index.html" <<'HTML'
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Home</title><style>body{background:#f6f7fb;color:#283244;font:16px system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0}.c{background:white;max-width:680px;padding:48px;border:1px solid #e6e9ef;border-radius:18px;box-shadow:0 14px 60px #27344b14}h1{font-size:30px;margin:0 0 14px}p{line-height:1.7;color:#607087}</style></head><body><main class="c"><h1>Welcome</h1><p>This service is currently available. Please check back later for updates.</p></main></body></html>
+  ask 'Домен этой ноды (например de.veloragrid.site): '; local d="${REPLY,,}" email
+  valid_domain "$d" || die 'Некорректный домен'
+  ask 'Email для Let’s Encrypt: '; email="$REPLY"
+  [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die 'Некорректный email'
+  ensure_nginx
+  [[ ! -e "$CONF" ]] || { yesno "Пересоздать управляемый конфиг $CONF?" || return; }
+  write_webroot "$d"
+  issue_cert "$d" "$email"
+  backup "$CONF"
+  cat >> "$CONF" <<NG
+server {
+  listen 127.0.0.1:9443 ssl http2;
+  listen unix:/dev/shm/nginx.sock ssl proxy_protocol http2;
+  server_name $d;
+  ssl_certificate /etc/letsencrypt/live/$d/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/$d/privkey.pem;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  server_tokens off;
+  root $SITE;
+  index index.html;
+  location / { try_files \$uri \$uri/ /index.html; }
+}
+NG
+  if [[ ! -f "$SITE/index.html" ]]; then
+    cat > "$SITE/index.html" <<'HTML'
+<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Welcome</title><style>body{font-family:system-ui;margin:10vh auto;max-width:720px;padding:0 24px;color:#283344}h1{font-weight:600}</style></head><body><h1>Welcome</h1><p>Service is online.</p></body></html>
 HTML
-  chmod 644 "$SITE_DIR/index.html"
-  cat > "$NGINX_SITE" <<CONF
-# Generated by remnanode-installer $VERSION. Reality fallback + plain HTTPS target.
-server {
-    listen 80;
-    server_name $domain;
-    return 301 https://\$host\$request_uri;
-}
-server {
-    listen 127.0.0.1:9443 ssl http2;
-    listen unix:/dev/shm/nginx.sock ssl proxy_protocol http2;
-    server_name $domain;
-    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    server_tokens off;
-    root $SITE_DIR;
-    index index.html;
-    location / { try_files \$uri \$uri/ /index.html; }
-}
-CONF
-  chmod 644 "$NGINX_SITE"
-  ln -sfn "$NGINX_SITE" "$NGINX_LINK"
-  # Do not change unrelated sites; test before reload/restart.
+    chmod 644 "$SITE/index.html"
+  fi
   if ! nginx -t; then
-    if [[ -n "$oldconf" ]]; then
-      cp -a "$oldconf" "$NGINX_SITE"
-    else
-      rm -f "$NGINX_SITE" "$NGINX_LINK"
-    fi
-    rm -f "${oldconf:-}"
-    die 'Nginx config invalid: restored previous site (if any).'
+    die 'Конфигурация Nginx не прошла проверку; резервная копия в /var/backups/rw-ins. Восстанови вручную перед reload.'
   fi
-  [[ -z "$oldconf" ]] || rm -f "$oldconf"
-  systemctl enable --now nginx
   systemctl reload nginx
-  write_cert_hook "$domain"
-  [[ -S /dev/shm/nginx.sock ]] || die 'Unix-сокет nginx не создан. Проверь systemctl status nginx.'
-  ok "Selfsteal готов для $domain. REALITY target: /dev/shm/nginx.sock, xver: 1."
-  warn 'Пока публичный 443/TCP по-прежнему принадлежит Xray. SNI edge не включён.'
-  warn 'Если приватный ключ в контейнере не читается, проверь UID/GID образа RemnaNode; не делай ключ world-readable.'
-  warn 'Если установлена старая RemnaNode, убедись, что /dev/shm смонтирован в контейнер.'
+  printf '%s\n' "$d" > "$DOMAIN_FILE"; chmod 600 "$DOMAIN_FILE"
+  write_hook
+  [[ -S /dev/shm/nginx.sock ]] || die 'Unix-сокет nginx не найден после перезагрузки'
+  ok "Selfsteal установлен: $d. Для REALITY target=/dev/shm/nginx.sock, xver=1."
+  warn 'Это не включает SNI edge. По умолчанию публичный 443 остаётся у Xray.'
 }
 
-ensure_edge_include() {
-  local marker='include /etc/nginx/remna-stream/*.conf;'
-  if ! grep -Fxq "$marker" /etc/nginx/nginx.conf; then
-    backup_file /etc/nginx/nginx.conf
-    printf '\n# Managed by RemnaNode installer — stream SNI edge.\n%s\n' "$marker" >> /etc/nginx/nginx.conf
+hy2_certs(){
+  local d email
+  if [[ -s "$DOMAIN_FILE" ]]; then
+    d="$(cat "$DOMAIN_FILE")"
+    if [[ -s "/etc/letsencrypt/live/$d/fullchain.pem" ]]; then
+      write_hook
+      ok "Сертификаты синхронизированы из $d в $CERT_DEST."
+      return
+    fi
   fi
+  if [[ -s "$CERT_DEST/fullchain.pem" && -s "$CERT_DEST/privkey.pem" ]]; then
+    ok "Сертификаты уже есть в $CERT_DEST. Не перезаписываю действующие файлы."
+    warn 'Убедись, что их продление настроено вне rw-ins.'
+    return
+  fi
+  warn 'Для выпуска HY2/XHTTP нужен домен, указывающий на этот сервер, и открытый TCP/80.'
+  if command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' | grep -Fxq nginx-selfsteal; then
+    warn 'Есть Docker selfsteal. Он не будет изменён; проверяй конфликты порта 80.'
+  fi
+  ask 'Домен для сертификата HY2/XHTTP: '; d="${REPLY,,}"
+  valid_domain "$d" || die 'Некорректный домен'
+  ask 'Email для Let’s Encrypt: '; email="$REPLY"
+  [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die 'Некорректный email'
+  ensure_nginx
+  if [[ -e "$CONF" ]]; then
+    warn "На этом сервере уже есть конфиг $CONF."
+    yesno 'Обновить управляемую HTTP-конфигурацию для выпуска сертификата?' || return
+  fi
+  write_webroot "$d"
+  issue_cert "$d" "$email"
+  printf '%s\n' "$d" > "$DOMAIN_FILE"; chmod 600 "$DOMAIN_FILE"
+  write_hook
+  ok "TLS-файлы Hysteria2/XHTTP: $CERT_DEST/fullchain.pem и privkey.pem"
+  warn 'Если существующий selfsteal управляет TLS отдельно, проверь его сертификат перед изменением домена.'
 }
 
-prepare_edge() {
-  preflight
+edge_prepare(){
   need nginx
-  [[ -s "$DOM_FILE" ]] || die 'Сначала установи selfsteal.'
-  [[ -f "$NGINX_SITE" ]] || die 'Не найден selfsteal Nginx конфиг.'
-  [[ -S /dev/shm/nginx.sock ]] || die 'Unix-сокет отсутствует; сначала почини selfsteal.'
-  [[ ! -f "$EDGE_ACTIVE" ]] || die 'SNI edge уже активен.'
-  local domain ipaddr addr cnt
-  domain="$(cat "$DOM_FILE")"
-  ask 'Локальный IPv4 сервера (должен быть назначен сетевому интерфейсу): '
-  ipaddr="$REPLY"
-  valid_ipv4 "$ipaddr" || die 'Некорректный IP'
-  ip -4 -o addr show scope global | awk '{split($4,a,"/");print a[1]}' | grep -Fxq "$ipaddr" \
-    || die 'Этот IP не назначен интерфейсу сервера. NAT-схема пока не поддерживается.'
-  mkdir -p "$EDGE_DIR"
-  # Importantly: stream ingress does not send PROXY protocol to Xray;
-  # Reality's existing xver=1 sends PROXY v1 only to Unix socket fallback.
-  cat > "$EDGE_PENDING" <<CONF
-# Stage only. Activate after REALITY binds 127.0.0.1:443 on THIS node.
+  [[ -s "$DOMAIN_FILE" ]] || die 'Сначала настрой selfsteal'
+  [[ -S /dev/shm/nginx.sock ]] || die 'Unix-сокет selfsteal отсутствует'
+  [[ ! -f "$EDGE_ACTIVE" ]] || die 'SNI edge уже активен'
+  local d; d="$(cat "$DOMAIN_FILE")"
+  mkdir -p /etc/nginx
+  cat > "$EDGE_FILE" <<NG
+# Created by rw-ins. Deliberately staged; not active until edge-activate.
 stream {
-    map \$ssl_preread_server_name \$remna_backend {
-        $domain 127.0.0.1:443;
-        default 127.0.0.1:9443;
-    }
-    server {
-        listen $ipaddr:443;
-        ssl_preread on;
-        preread_buffer_size 64k;
-        preread_timeout 15s;
-        proxy_connect_timeout 5s;
-        proxy_timeout 1h;
-        proxy_pass \$remna_backend;
-    }
+  map \$ssl_preread_server_name \$rwins_backend {
+    $d 127.0.0.1:1443;
+    default 127.0.0.1:9443;
+  }
+  server {
+    listen 0.0.0.0:443;
+    listen [::]:443 ipv6only=on;
+    ssl_preread on;
+    preread_buffer_size 64k;
+    preread_timeout 15s;
+    proxy_connect_timeout 5s;
+    proxy_timeout 1h;
+    proxy_pass \$rwins_backend;
+  }
 }
-CONF
-  chmod 644 "$EDGE_PENDING"
-  # Validate by including the ordinary main config plus staged stream config as top-level context.
-  local tmp
-  tmp="$(mktemp /tmp/remna-nginx-check.XXXXXX)"
-  printf 'include /etc/nginx/nginx.conf;\ninclude %s;\n' "$EDGE_PENDING" > "$tmp"
-  if ! nginx -p /etc/nginx/ -t -c "$tmp"; then
-    rm -f "$tmp"
-    die 'Проверка синтаксиса SNI edge не пройдена. Рабочий Nginx не изменён.'
-  fi
+NG
+  chmod 644 "$EDGE_FILE"
+  # Validate syntax with temp main config; stream module is loaded by nginx.conf.
+  local tmp; tmp="$(mktemp /etc/nginx/rwins-test.XXXXXX)"
+  printf 'include /etc/nginx/nginx.conf;\ninclude %s;\n' "$EDGE_FILE" > "$tmp"
+  nginx -p /etc/nginx -c "$tmp" -t
   rm -f "$tmp"
-  ok "Подготовлено: $EDGE_PENDING (SNI $domain → Xray; прочие → обычный HTTPS)"
-  warn 'НЕ АКТИВИРОВАНО. В отдельном тестовом профиле Remnawave переведи REALITY listen на 127.0.0.1:443 ТОЛЬКО для этой ноды.'
-  warn 'Не меняй общий профиль сразу для всех нод!'
-  warn 'Для внешнего IPv6 этот конфиг ничего не меняет. Отключи/обработай AAAA отдельно.'
+  ok "Подготовлен: $EDGE_FILE"
+  warn 'Для тестовой ноды REALITY должен слушать 127.0.0.1:1443, а не 0.0.0.0:443.'
+  warn 'Если используешь один Config Profile на всех нодах — сделай временный тестовый профиль. Не переключай всех одновременно.'
 }
-
-activate_edge() {
-  preflight
-  [[ -f "$EDGE_PENDING" ]] || die 'Сначала выполни подготовку SNI edge.'
-  [[ ! -e "$EDGE_ACTIVE" ]] || die 'SNI edge уже активирован.'
-  need ss; need nginx
-  local sockets line
-  sockets="$(ss -H -lnt '( sport = :443 )' | awk '{print $4}')"
-  grep -Fxq '127.0.0.1:443' <<< "$sockets" \
-    || die 'Xray на 127.0.0.1:443 не слушает. Сначала переключи эту ноду на тестовый профиль.'
-  while IFS= read -r line; do
-    [[ -z "$line" || "$line" == '127.0.0.1:443' ]] && continue
-    die "На 443/TCP есть другой listener: $line — проверь перед активацией."
-  done <<< "$sockets"
-  confirm 'Активировать публичный Nginx stream :443 на ЭТОЙ ноде?' || return 0
-  ensure_edge_include
-  cp -a "$EDGE_PENDING" "$EDGE_ACTIVE"
+edge_activate(){
+  [[ -s "$EDGE_FILE" ]] || die 'Сначала выбери Подготовить SNI edge'
+  [[ ! -e "$EDGE_ACTIVE" ]] || die 'SNI edge уже активен'
+  local x;
+  x="$(ss -H -lnt '( sport = :1443 )' | awk '{print $4}')"
+  grep -Fxq '127.0.0.1:1443' <<< "$x" || die 'Нет Xray на 127.0.0.1:1443. Сначала переключи тестовый профиль.'
+  if ss -H -lnt '( sport = :443 )' | grep -q .; then
+    ss -H -lntp '( sport = :443 )'
+    die '443/TCP занят. Сначала освободи порт от старого Xray.'
+  fi
+  yesno 'Активировать Nginx на 443/TCP?' || return
+  if grep -Fq 'include /etc/nginx/rw-ins-edge.conf;' /etc/nginx/nginx.conf; then
+    :
+  else
+    backup /etc/nginx/nginx.conf
+    printf '\n# rw-ins SNI edge, top-level stream context\ninclude /etc/nginx/rw-ins-edge.conf;\n' >> /etc/nginx/nginx.conf
+  fi
+  cp "$EDGE_FILE" "$EDGE_ACTIVE"
   if ! nginx -t || ! systemctl reload nginx; then
     rm -f "$EDGE_ACTIVE"
     nginx -t && systemctl reload nginx || true
-    die 'Активация провалилась: конфигурация stream удалена. Xray остался на loopback.'
+    die 'Не удалось включить SNI edge; конфиг отключён. Проверь состояние порта 443.'
   fi
-  printf 'activated=%s\n' "$(date -Is)" > "$EDGE_STATE"
-  ok 'SNI edge активирован. Проверь REALITY, сайт и чужой SNI с внешней машины.'
-  warn 'Известный риск: nginx ssl_preread + параллельные REALITY ClientHello могут зависать на некоторых версиях Xray.'
-  warn 'Чужой SNI получает реальный HTTPS-сайт, но его сертификат не совпадает с чужим именем — это ожидаемо.'
-  warn 'Откат отключит публичный 443; восстанови Xray bind после освобождения порта.'
+  ok 'SNI edge включён. Свой SNI → REALITY localhost:1443; чужие SNI → обычный HTTPS localhost:9443.'
+  warn 'Это не гарантирует защиту от IP-блокировок. Проверь параллельные подключения и fallback перед развёртыванием на других нодах.'
 }
-
-disable_edge() {
-  preflight
-  [[ -f "$EDGE_ACTIVE" ]] || { warn 'SNI edge не активен.'; return 0; }
-  warn 'Отключение Nginx stream сделает REALITY недоступным извне, пока он слушает 127.0.0.1.'
-  confirm 'Точно отключить SNI edge?' || return 0
-  backup_file "$EDGE_ACTIVE"
+edge_disable(){
+  [[ -e "$EDGE_ACTIVE" ]] || { warn 'SNI edge не включён'; return; }
+  warn 'Xray по-прежнему будет слушать только localhost:1443, и внешний VPN пропадёт после отключения Nginx edge.'
+  yesno 'Отключить SNI edge? Используй консоль провайдера или подготовь возврат Xray в профиль.' || return
+  backup "$EDGE_ACTIVE"
   rm -f "$EDGE_ACTIVE"
-  if ! nginx -t || ! systemctl reload nginx; then
-    die 'Не удалось перезагрузить Nginx после отключения. Проверь nginx -t.'
-  fi
-  rm -f "$EDGE_STATE"
-  ok 'Публичный stream слушатель отключён. Теперь можно вернуть Xray на 0.0.0.0:443.'
+  nginx -t && systemctl reload nginx || die 'Не удалось перезагрузить Nginx'
+  ok 'SNI edge отключён. Верни публичный Xray listener только после проверки.'
 }
 
-show_status() {
-  printf '=== RemnaNode Installer %s ===\n' "$VERSION"
-  printf '\nPorts TCP/UDP:\n'
-  ss -lntup | grep -E '(:443|:8443|:2222|:9443)' || true
-  printf '\nContainers:\n'
-  if command -v docker >/dev/null 2>&1; then docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' || true; fi
-  printf '\nSelfsteal:\n'
-  [[ -s "$DOM_FILE" ]] && { printf 'Domain: '; cat "$DOM_FILE"; } || echo 'not configured by this installer'
-  [[ -S /dev/shm/nginx.sock ]] && echo 'Unix socket: OK' || echo 'Unix socket: absent'
-  if command -v nginx >/dev/null; then nginx -t || true; fi
-  [[ -f "$EDGE_ACTIVE" ]] && echo 'SNI edge: ACTIVE' || echo 'SNI edge: inactive'
-  [[ -f "$EDGE_PENDING" ]] && echo "Pending: $EDGE_PENDING" || true
-  if [[ -s "$DOM_FILE" ]]; then
-    local d; d="$(cat "$DOM_FILE")"
+fw_remove_rules(){
+  local port="$1" tool ch
+  for tool in iptables ip6tables; do
+    if [[ $tool == iptables ]]; then ch="$FW_C4"; else ch="$FW_C6"; fi
+    while "$tool" -w -C INPUT -p tcp --dport "$port" -m comment --comment "$FW_TAG" -j "$ch" 2>/dev/null; do
+      "$tool" -w -D INPUT -p tcp --dport "$port" -m comment --comment "$FW_TAG" -j "$ch"
+    done
+    "$tool" -w -F "$ch" 2>/dev/null || true
+    "$tool" -w -X "$ch" 2>/dev/null || true
+  done
+}
+fw_apply(){
+  local panel="$1" port="$2" prev=''
+  valid_ipv4 "$panel" || die 'Неверный IPv4 панели'
+  valid_port "$port" || die 'Неверный NODE_PORT'
+  need iptables; need ip6tables
+  [[ -f "$FW_CONF" ]] && { . "$FW_CONF"; prev="$PORT"; }
+  [[ -z "$prev" ]] || fw_remove_rules "$prev"
+  iptables -w -N "$FW_C4" 2>/dev/null || true
+  ip6tables -w -N "$FW_C6" 2>/dev/null || true
+  iptables -w -F "$FW_C4"
+  ip6tables -w -F "$FW_C6"
+  iptables -w -A "$FW_C4" -s "$panel/32" -j ACCEPT
+  iptables -w -A "$FW_C4" -j DROP
+  ip6tables -w -A "$FW_C6" -j DROP
+  # Insert as the first INPUT rule to avoid existing broad ACCEPT for TCP/2222.
+  iptables -w -I INPUT 1 -p tcp --dport "$port" -m comment --comment "$FW_TAG" -j "$FW_C4"
+  ip6tables -w -I INPUT 1 -p tcp --dport "$port" -m comment --comment "$FW_TAG" -j "$FW_C6"
+  printf 'PANEL=%s\nPORT=%s\n' "$panel" "$port" > "$FW_CONF"; chmod 600 "$FW_CONF"
+}
+fw_persist(){
+  cat > "$FW_UNIT" <<'UNIT'
+[Unit]
+Description=Allow RemnaNode API only from designated panel IPv4
+After=network-pre.target
+Before=docker.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rw-ins firewall-reapply
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable rw-ins-api-firewall.service >/dev/null
+}
+fw_menu(){
+  command -v iptables >/dev/null 2>&1 && command -v ip6tables >/dev/null 2>&1 || apt_install iptables
+  need iptables; need ip6tables
+  local p panel
+  p="$(node_port)"
+  printf '\nТекущий NODE_PORT (определён автоматически): %s\n' "$p"
+  ask "Порт API ноды [$p]: "; p="${REPLY:-$p}"
+  valid_port "$p" || die 'Неверный порт'
+  ask 'Публичный IPv4 НОВОЙ панели (не домен): '; panel="$REPLY"
+  valid_ipv4 "$panel" || die 'Неверный IPv4 панели'
+  printf '\nРазрешённый IP: %s; порт: %s/TCP\n' "$panel" "$p"
+  warn 'IPv6 на этом порту будет закрыт полностью. Если панель подключается через IPv6, этот режим не подходит.'
+  yesno 'Применить и сохранить правило после перезагрузки?' || return
+  fw_apply "$panel" "$p"
+  fw_persist
+  ok 'Правило включено. Проверь, что панель всё ещё видит ноду.'
+}
+fw_reapply(){
+  [[ -r "$FW_CONF" ]] || die 'Конфигурация firewall не найдена'
+  . "$FW_CONF"
+  fw_apply "$PANEL" "$PORT"
+}
+fw_remove(){
+  [[ -r "$FW_CONF" ]] || { warn 'Ограничение не настроено'; return; }
+  . "$FW_CONF"
+  yesno 'Удалить правила ограничения NODE_PORT?' || return
+  systemctl disable rw-ins-api-firewall.service >/dev/null 2>&1 || true
+  fw_remove_rules "$PORT"
+  rm -f "$FW_CONF" "$FW_UNIT"
+  systemctl daemon-reload
+  ok 'Правила rw-ins удалены'
+}
+fw_status(){
+  if [[ -f "$FW_CONF" ]]; then
+    . "$FW_CONF"; printf 'NODE_PORT=%s PANEL=%s\n' "$PORT" "$PANEL"
+  else
+    echo 'Ограничение rw-ins ещё не включено'
+  fi
+  command -v iptables >/dev/null 2>&1 && iptables -S INPUT | grep -F "$FW_TAG" || true
+  command -v ip6tables >/dev/null 2>&1 && ip6tables -S INPUT | grep -F "$FW_TAG" || true
+  systemctl is-enabled rw-ins-api-firewall.service 2>/dev/null || true
+}
+
+status(){
+  printf '\n===== rw-ins %s =====\n' "$VERSION"
+  printf 'Версия образа для новых установок: %s\n' "$NODE_IMAGE"
+  printf 'Домен selfsteal: %s\n' "$(cat "$DOMAIN_FILE" 2>/dev/null || echo не настроен)"
+  printf 'Nginx edge: '; [[ -f "$EDGE_ACTIVE" ]] && echo включён || echo выключен
+  printf 'Unix-сокет: '; [[ -S /dev/shm/nginx.sock ]] && echo OK || echo отсутствует
+  printf '\nКонтейнеры:\n'
+  command -v docker >/dev/null 2>&1 && docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' || true
+  printf '\nПорты:\n'
+  command -v ss >/dev/null 2>&1 && ss -lntup | grep -E ':(443|8443|2222|1443|9443)[[:space:]]' || true
+  printf '\nОграничение API:\n'; fw_status
+  if [[ -f "$DOMAIN_FILE" ]]; then
+    local d; d="$(cat "$DOMAIN_FILE")"
     openssl x509 -in "/etc/letsencrypt/live/$d/fullchain.pem" -noout -subject -enddate 2>/dev/null || true
   fi
-  if ip link show warp >/dev/null 2>&1; then echo 'WARP interface: exists'; else echo 'WARP interface: not present'; fi
 }
 
-update_node() {
-  preflight
-  need docker
-  [[ -f "$NODE_DIR/docker-compose.yml" ]] || die 'Compose ноды не найден.'
-  backup_file "$NODE_DIR/docker-compose.yml"
-  (cd "$NODE_DIR" && docker compose pull && docker compose up -d)
-  ok 'Образ ноды обновлён.'
+warp_status(){
+  if ip link show warp >/dev/null 2>&1; then
+    ok 'Интерфейс warp существует'
+    ip -d link show warp || true
+  else
+    warn 'Интерфейс warp не обнаружен. rw-ins пока не устанавливает Cloudflare WARP.'
+  fi
+  if command -v wg >/dev/null 2>&1; then wg show 2>/dev/null || true; fi
+}
+generate_sid(){ need openssl; printf 'Новый shortId (16 hex): %s\n' "$(openssl rand -hex 8)"; warn 'Он не добавлен в Config Profile. Для старых клиентов сначала оставь пустой SID, затем постепенно мигрируй.'; }
+update_cli(){
+  need curl
+  warn 'Это обновит только команду rw-ins, не Docker и не Xray.'
+  yesno "Загрузить текущую версию из $SELF_URL?" || return
+  local tmp; tmp="$(mktemp "$STATE/update.XXXXXXXX")"
+  curl -fsSL --retry 2 --max-time 30 "$SELF_URL" -o "$tmp"
+  [[ $(wc -c < "$tmp") -gt 2000 ]] || { rm -f "$tmp"; die 'Загруженный файл слишком мал'; }
+  bash -n "$tmp" || { rm -f "$tmp"; die 'Новая версия содержит синтаксическую ошибку'; }
+  backup "$SELF"
+  install -m 0755 "$tmp" "$SELF"
+  rm -f "$tmp"
+  ok 'rw-ins обновлён. Запусти rw-ins заново.'
 }
 
-shortid() {
-  need openssl
-  printf 'Новый shortId REALITY (16 hex): %s\n' "$(openssl rand -hex 8)"
-  warn 'Добавь ID в REALITY shortIds профиля и настрой выдачу в Host/подписках. Текущий профиль не изменён.'
-}
-
-help_text() {
-  cat <<EOF
-RemnaNode standalone installer $VERSION
-Использование: sudo bash install.sh [menu|node|selfsteal|edge-prepare|edge-activate|edge-disable|status|update|shortid|help]
-Новый скрипт не переписывает существующий docker-compose.yml и не запускает чужие Bash-скрипты.
-Важно: это отдельная реализация (preview), а не точная копия предыдущего установщика.
-EOF
-}
-menu() {
+menu(){
+  root_only
   while true; do
-    printf '\n===== RemnaNode installer %s =====\n' "$VERSION"
-    printf ' 1) Установить RemnaNode (Docker + Compose)\n'
-    printf ' 2) Настроить Nginx selfsteal + SSL + сертификаты для HY2/XHTTP\n'
-    printf ' 3) Подготовить SNI edge (БЕЗ переключения трафика)\n'
-    printf ' 4) Активировать SNI edge на тестовой ноде\n'
-    printf ' 5) Отключить SNI edge\n'
-    printf ' 6) Диагностика\n'
-    printf ' 7) Обновить образ RemnaNode\n'
-    printf ' 8) Сгенерировать shortId\n'
-    printf ' 0) Выход\n'
-    ask 'Выбор: '
+    cat <<MENU
+
+  ╔════════════════════════════════════════════════════╗
+  ║   rw-ins — RemnaNode Installer  $VERSION       ║
+  ╠════════════════════════════════════════════════════╣
+  ║  1. Установить / проверить RemnaNode                 ║
+  ║  2. Настроить Nginx Selfsteal + HTTPS               ║
+  ║  3. Сертификаты Hysteria2 / XHTTP                   ║
+  ║  4. Подготовить SNI Edge (не включает)              ║
+  ║  5. Включить SNI Edge на тестовой ноде               ║
+  ║  6. Отключить SNI Edge                              ║
+  ║  7. Защитить NODE_PORT по IP панели                 ║
+  ║  8. Удалить правила защиты NODE_PORT                ║
+  ║  9. Проверка сервера и firewall                     ║
+  ║ 10. Проверить продление сертификатов (dry-run)      ║
+  ║ 11. Сгенерировать REALITY shortId                   ║
+  ║ 12. Обновить сам rw-ins (по запросу)                ║
+  ║ 13. Проверить WARP (без изменений)                 ║
+  ║  0. Выход                                           ║
+  ╚════════════════════════════════════════════════════╝
+MENU
+    ask 'Выбери номер: '
     case "$REPLY" in
-      1) install_node;;
-      2) install_selfsteal;;
-      3) prepare_edge;;
-      4) activate_edge;;
-      5) disable_edge;;
-      6) show_status;;
-      7) update_node;;
-      8) shortid;;
-      0|q|Q) return;;
-      *) warn 'Неизвестный пункт';;
+      1) install_node ;;
+      2) selfsteal ;;
+      3) hy2_certs ;;
+      4) edge_prepare ;;
+      5) edge_activate ;;
+      6) edge_disable ;;
+      7) fw_menu ;;
+      8) fw_remove ;;
+      9) status ;;
+      10) need certbot; certbot renew --dry-run ;;
+      11) generate_sid ;;
+      12) update_cli ;;
+      13) warp_status ;;
+      0|q|Q) return ;;
+      *) warn 'Неизвестный пункт' ;;
     esac
   done
 }
+usage(){
+  cat <<USAGE
+rw-ins $VERSION
+  menu               Interactive menu. Initial launch installs local CLI + Docker and offers RemnaNode setup.
+  status             Show server status (read-only).
+  firewall-reapply   Non-interactive: restore configured NODE_PORT firewall rules (systemd service).
+  self-install       Save this running script as /usr/local/bin/rw-ins.
+  --version          Print version.
 
-case "${1:-menu}" in
-  menu) menu;;
-  node) install_node;;
-  selfsteal) install_selfsteal;;
-  edge-prepare) prepare_edge;;
-  edge-activate) activate_edge;;
-  edge-disable) disable_edge;;
-  status) show_status;;
-  update) update_node;;
-  shortid) shortid;;
-  help|--help|-h) help_text;;
-  --version) echo "$VERSION";;
-  *) help_text; exit 2;;
-esac
+First run from GitHub:
+  sudo bash -c "\$(curl -fsSL $SELF_URL)"
+After that:
+  sudo rw-ins
+
+Existing nodes are NOT overwritten. A staging SNI edge requires a dedicated temporary Config Profile.
+USAGE
+}
+main(){
+  init
+  case "${1:-menu}" in
+    menu)
+      local was_installed=1 invoked_from_cli=0
+      [[ -f "$SELF" ]] || was_installed=0
+      [[ "${BASH_SOURCE[0]:-}" == "$SELF" ]] && invoked_from_cli=1
+      if (( ! invoked_from_cli )); then
+        install_self
+      fi
+      if (( ! was_installed )); then
+        ensure_docker
+        if ! node_exists; then
+          warn 'RemnaNode не обнаружена; для установки необходим SECRET_KEY из панели.'
+          if yesno 'Установить ноду прямо сейчас?'; then install_node; fi
+        fi
+      fi
+      menu
+      ;;
+    status) status ;;
+    firewall-reapply) fw_reapply ;;
+    self-install) install_self ;;
+    --version) printf '%s\n' "$VERSION" ;;
+    help|--help|-h) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+main "$@"
