@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION='0.2.0-preview'
+VERSION='0.3.0-preview'
 SELF='/usr/local/bin/rw-ins'
 SELF_URL='https://raw.githubusercontent.com/KinG123124/remnanode-installer/refs/heads/main/install.sh'
 STATE='/etc/rw-ins'
@@ -25,6 +25,16 @@ FW_C4='RWINSAPI4'
 FW_C6='RWINSAPI6'
 FW_TAG='rw-ins-node-api'
 BACKUPS='/var/backups/rw-ins'
+# Existing (legacy) selfsteal, installed by the former third-party installer.
+LEGACY_DIR='/opt/nginx-selfsteal'
+LEGACY_MAIN="$LEGACY_DIR/nginx.conf"
+LEGACY_SITE="$LEGACY_DIR/conf.d/selfsteal.conf"
+LEGACY_TLS="$LEGACY_DIR/conf.d/rwins-edge-https.conf"
+LEGACY_STREAM_DIR="$LEGACY_DIR/conf.d/rwins-stream"
+LEGACY_STREAM="$LEGACY_STREAM_DIR/edge.conf"
+LEGACY_STATE="$STATE/legacy-edge.env"
+LEGACY_MARK_BEGIN='# BEGIN RWINS LEGACY SNI EDGE'
+LEGACY_MARK_END='# END RWINS LEGACY SNI EDGE'
 
 info(){ printf '\033[34m[i]\033[0m %s\n' "$*"; }
 ok(){ printf '\033[32m[+]\033[0m %s\n' "$*"; }
@@ -326,7 +336,7 @@ hy2_certs(){
   warn 'Если существующий selfsteal управляет TLS отдельно, проверь его сертификат перед изменением домена.'
 }
 
-edge_prepare(){
+host_edge_prepare(){
   need nginx
   [[ -s "$DOMAIN_FILE" ]] || die 'Сначала настрой selfsteal'
   [[ -S /dev/shm/nginx.sock ]] || die 'Unix-сокет selfsteal отсутствует'
@@ -362,7 +372,7 @@ NG
   warn 'Для тестовой ноды REALITY должен слушать 127.0.0.1:1443, а не 0.0.0.0:443.'
   warn 'Если используешь один Config Profile на всех нодах — сделай временный тестовый профиль. Не переключай всех одновременно.'
 }
-edge_activate(){
+host_edge_activate(){
   [[ -s "$EDGE_FILE" ]] || die 'Сначала выбери Подготовить SNI edge'
   [[ ! -e "$EDGE_ACTIVE" ]] || die 'SNI edge уже активен'
   local x;
@@ -388,7 +398,7 @@ edge_activate(){
   ok 'SNI edge включён. Свой SNI → REALITY localhost:1443; чужие SNI → обычный HTTPS localhost:9443.'
   warn 'Это не гарантирует защиту от IP-блокировок. Проверь параллельные подключения и fallback перед развёртыванием на других нодах.'
 }
-edge_disable(){
+host_edge_disable(){
   [[ -e "$EDGE_ACTIVE" ]] || { warn 'SNI edge не включён'; return; }
   warn 'Xray по-прежнему будет слушать только localhost:1443, и внешний VPN пропадёт после отключения Nginx edge.'
   yesno 'Отключить SNI edge? Используй консоль провайдера или подготовь возврат Xray в профиль.' || return
@@ -396,6 +406,255 @@ edge_disable(){
   rm -f "$EDGE_ACTIVE"
   nginx -t && systemctl reload nginx || die 'Не удалось перезагрузить Nginx'
   ok 'SNI edge отключён. Верни публичный Xray listener только после проверки.'
+}
+
+# ---------------- Existing Docker-based selfsteal migration ----------------
+# Does NOT replace the container, its mount layout, ACME, HTML, or certificate files.
+legacy_container_exists(){
+  command -v docker >/dev/null 2>&1 && \
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq nginx-selfsteal
+}
+legacy_container_running(){
+  command -v docker >/dev/null 2>&1 && \
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq nginx-selfsteal
+}
+legacy_require(){
+  legacy_container_running || die 'nginx-selfsteal не запущен; старую установку менять нельзя'
+  [[ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' nginx-selfsteal 2>/dev/null)" == host ]] || die 'Ожидался Docker network_mode=host'
+  local m
+  m="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/nginx/nginx.conf"}}{{.Source}}{{end}}{{end}}' nginx-selfsteal)"
+  [[ "$m" == "$LEGACY_MAIN" ]] || die "Неожиданный mount nginx.conf ($m); не меняю конфиг"
+  m="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/nginx/conf.d"}}{{.Source}}{{end}}{{end}}' nginx-selfsteal)"
+  [[ "$m" == "$LEGACY_DIR/conf.d" ]] || die "Неожиданный mount conf.d ($m); не меняю конфиг"
+  [[ -f "$LEGACY_MAIN" && -f "$LEGACY_SITE" ]] || die 'Не найдены конфиги прежнего selfsteal'
+  grep -Fq 'unix:/dev/shm/nginx.sock' "$LEGACY_SITE" || die 'Не подтверждён старый REALITY fallback Unix-сокет'
+  grep -Eq 'proxy_protocol' "$LEGACY_SITE" || die 'Не подтверждён PROXY protocol в старом selfsteal'
+  docker exec nginx-selfsteal nginx -V 2>&1 | grep -q -- '--with-stream_ssl_preread_module' || die 'nginx-selfsteal не поддерживает ssl_preread'
+  docker exec nginx-selfsteal nginx -t || die 'Существующая конфигурация Nginx невалидна; нельзя обновлять'
+  [[ -S /dev/shm/nginx.sock ]] || die 'Unix-сокет Nginx отсутствует'
+  [[ -s "$LEGACY_DIR/ssl/fullchain.crt" && -s "$LEGACY_DIR/ssl/private.key" ]] || die 'Нет TLS-сертификатов старого selfsteal'
+}
+legacy_domain(){
+  local d
+  d="$(awk '/^[[:space:]]*server_name[[:space:]]+/ {x=$2; sub(/;.*/, "", x); print tolower(x); exit}' "$LEGACY_SITE")"
+  valid_domain "$d" || die "Не удалось распознать домен selfsteal ($d)"
+  printf '%s' "$d"
+}
+legacy_mode(){
+  [[ -f "$LEGACY_STREAM" ]] || { echo 'off'; return; }
+  if grep -Fq 'listen 127.0.0.1:9444;' "$LEGACY_STREAM"; then echo 'test'
+  elif grep -Fq 'listen 0.0.0.0:443;' "$LEGACY_STREAM"; then echo 'active'
+  else echo 'unknown'; fi
+}
+legacy_port_busy(){
+  local p="$1"
+  ss -H -lnt "( sport = :$p )" 2>/dev/null | grep -q .
+}
+legacy_record_state(){
+  local domain="$1" mode="$2" backup_dir="$3"
+  # Only validated domain and controlled local path are written to this sourceable file.
+  printf 'DOMAIN=%s\nMODE=%s\nBACKUP=%s\n' "$domain" "$mode" "$backup_dir" > "$LEGACY_STATE"
+  chmod 600 "$LEGACY_STATE"
+}
+legacy_restore_before_reload(){
+  local saved_main="$1"
+  cp -a "$saved_main" "$LEGACY_MAIN"
+  rm -f "$LEGACY_TLS" "$LEGACY_STREAM" "$LEGACY_STATE"
+  docker exec nginx-selfsteal nginx -t >/dev/null 2>&1 || warn 'Даже исходный Nginx не прошёл nginx -t — проверь конфиг вручную'
+}
+legacy_prepare(){
+  legacy_require
+  local d mode snapshot
+  d="$(legacy_domain)"
+  mode="$(legacy_mode)"
+  if [[ "$mode" == test || "$mode" == active ]]; then
+    ok "SNI Edge уже подготовлен: $mode, домен $d"
+    legacy_test
+    return
+  fi
+  [[ "$mode" == off ]] || die "Неизвестное состояние SNI Edge: $mode"
+  [[ ! -e "$LEGACY_TLS" && ! -e "$LEGACY_STREAM" ]] || die 'Есть файлы rw-ins с неизвестным содержимым. Не перезаписываю'
+  if grep -Eq '^[[:space:]]*stream[[:space:]]*\{' "$LEGACY_MAIN"; then
+    die 'В основном nginx.conf уже есть stream. Во избежание конфликта нужна ручная проверка'
+  fi
+  if grep -Fq "$LEGACY_MARK_BEGIN" "$LEGACY_MAIN"; then
+    die 'Маркер rw-ins в nginx.conf уже присутствует; автоматическая повторная установка запрещена'
+  fi
+  grep -Fq 'include /etc/nginx/conf.d/*.conf;' "$LEGACY_MAIN" || die 'Не найден типовой http include; конфиг нестандартный'
+  for p in 9443 9444; do
+    legacy_port_busy "$p" && die "TCP/$p уже занят, тестовые порты недоступны"
+  done
+  printf '\nНайден прежний selfsteal, домен: %s\n' "$d"
+  info 'Добавлю только HTTP listener 127.0.0.1:9443 и stream listener 127.0.0.1:9444.'
+  info 'Публичный Xray :443, API :2222, HY2 :443/UDP и XHTTP :8443 не меняются.'
+  yesno 'Создать тестовый SNI Edge и перечитать Nginx?' || return
+  snapshot="$BACKUPS/legacy-edge-$(date +%Y%m%d-%H%M%S)-$$"
+  mkdir -p "$snapshot" "$LEGACY_STREAM_DIR"
+  cp -a "$LEGACY_MAIN" "$snapshot/nginx.conf"
+  cp -a "$LEGACY_SITE" "$snapshot/selfsteal.conf"
+  cat > "$LEGACY_TLS" <<NG
+# Managed by rw-ins; loopback-only HTTPS default for foreign/missing SNI.
+server {
+    listen 127.0.0.1:9443 ssl;
+    server_name $d;
+    ssl_certificate /etc/nginx/ssl/fullchain.crt;
+    ssl_certificate_key /etc/nginx/ssl/private.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    root /var/www/html;
+    index index.html index.htm;
+    location / { try_files \$uri \$uri/ /index.html; }
+}
+NG
+  cat > "$LEGACY_STREAM" <<NG
+# RWINS LEGACY EDGE: TEST MODE; only loopback, production :443 not touched.
+log_format rwins_edge '\$remote_addr [\$time_local] sni="\$ssl_preread_server_name" upstream="\$upstream_addr" status=\$status';
+access_log /var/log/nginx/rwins-edge.log rwins_edge;
+map \$ssl_preread_server_name \$rwins_backend {
+    $d 127.0.0.1:443;
+    default 127.0.0.1:9443;
+}
+server {
+    listen 127.0.0.1:9444;
+    ssl_preread on;
+    preread_buffer_size 64k;
+    preread_timeout 15s;
+    proxy_connect_timeout 5s;
+    proxy_timeout 1h;
+    proxy_pass \$rwins_backend;
+}
+NG
+  cat >> "$LEGACY_MAIN" <<'NG'
+
+# BEGIN RWINS LEGACY SNI EDGE
+stream {
+    include /etc/nginx/conf.d/rwins-stream/*.conf;
+}
+# END RWINS LEGACY SNI EDGE
+NG
+  if ! docker exec nginx-selfsteal nginx -t; then
+    legacy_restore_before_reload "$snapshot/nginx.conf"
+    die 'Nginx -t не прошёл; исходный конфиг автоматически восстановлен, reload НЕ делался'
+  fi
+  if ! docker exec nginx-selfsteal nginx -s reload; then
+    legacy_restore_before_reload "$snapshot/nginx.conf"
+    docker exec nginx-selfsteal nginx -s reload >/dev/null 2>&1 || true
+    die 'Не удалось выполнить reload; конфиг восстановлен'
+  fi
+  legacy_record_state "$d" test "$snapshot"
+  ok "Тестовый SNI Edge установлен, бэкап: $snapshot"
+  legacy_test
+}
+legacy_test(){
+  legacy_require
+  local d mode port good bad
+  [[ -f "$LEGACY_STREAM" ]] || die 'SNI Edge не подготовлен'
+  d="$(legacy_domain)"; mode="$(legacy_mode)"
+  case "$mode" in
+    test) port=9444 ;;
+    active) port=443 ;;
+    *) die "Неизвестный режим SNI Edge: $mode" ;;
+  esac
+  printf '\nSNI Edge: %s; домен: %s; вход: TCP/%s\n' "$mode" "$d" "$port"
+  if [[ "$mode" == test ]]; then
+    need curl
+    good="$(curl -ksS --noproxy '*' --connect-timeout 5 --max-time 12 \
+      --resolve "$d:$port:127.0.0.1" -o /dev/null -w '%{http_code}' "https://$d:$port/" 2>/dev/null || true)"
+    bad="$(curl -ksS --noproxy '*' --connect-timeout 5 --max-time 12 \
+      --resolve "sni-probe.invalid:$port:127.0.0.1" -o /dev/null -w '%{http_code}' "https://sni-probe.invalid:$port/" 2>/dev/null || true)"
+    printf 'HTTPS свой SNI: HTTP %s\n' "${good:-FAIL}"
+    printf 'HTTPS чужой SNI: HTTP %s\n' "${bad:-FAIL}"
+    [[ "$good" =~ ^[123][0-9][0-9]$ && "$bad" =~ ^[123][0-9][0-9]$ ]] || warn 'Один из тестовых запросов не прошёл — не активируй Edge до устранения причины'
+  fi
+  echo 'Последние маршруты:'
+  docker exec nginx-selfsteal sh -c 'tail -n 8 /var/log/nginx/rwins-edge.log 2>/dev/null || true'
+  if [[ "$mode" == test ]]; then
+    info 'Тестовый порт слушает только localhost:9444; внешние подключения не изменены.'
+  fi
+  warn 'Чужой SNI получит сертификат домена этой ноды — проверка имени в браузере не пройдёт.'
+}
+legacy_activate(){
+  legacy_require
+  local mode d snapshot
+  mode="$(legacy_mode)"; [[ "$mode" == test ]] || die 'Сначала подготовь SNI Edge (пункт 4)'
+  d="$(legacy_domain)"
+  [[ -S /dev/shm/nginx.sock ]] || die 'Unix-сокет selfsteal отсутствует'
+  ss -H -lnt '( sport = :1443 )' | grep -Fq '127.0.0.1:1443' || die 'REALITY ещё не слушает 127.0.0.1:1443'
+  if legacy_port_busy 443; then
+    ss -H -lntp '( sport = :443 )'
+    die 'Порт 443/TCP ещё занят. Сначала назначь ТОЛЬКО этой ноде тестовый профиль REALITY localhost:1443.'
+  fi
+  if ! legacy_port_busy 9443; then die 'Нет HTTPS-сайта на 127.0.0.1:9443'; fi
+  printf '\nАКТИВАЦИЯ SNI EDGE на %s\n' "$d"
+  info '443/TCP теперь займёт существующий Docker Nginx, а REALITY останется на localhost:1443.'
+  warn 'Автоматический откат не способен изменить Config Profile в Remnawave.'
+  yesno 'Действительно переключить публичный TCP/443 на Nginx?' || return
+  snapshot="$BACKUPS/legacy-edge-activate-$(date +%Y%m%d-%H%M%S)-$$"
+  mkdir -p "$snapshot"; cp -a "$LEGACY_STREAM" "$snapshot/edge.conf"
+  # Adjust ONLY our generated file; preserve existing selfsteal and certificate configuration.
+  sed -i -e 's/127\.0\.0\.1:443;/127.0.0.1:1443;/' \
+         -e 's/listen 127\.0\.0\.1:9444;/listen 0.0.0.0:443;/' "$LEGACY_STREAM"
+  if command -v ip >/dev/null 2>&1 && ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 '; then
+    sed -i '/listen 0.0.0.0:443;/a\    listen [::]:443 ipv6only=on;' "$LEGACY_STREAM"
+  fi
+  if ! grep -Fq 'listen 0.0.0.0:443;' "$LEGACY_STREAM" || \
+     ! grep -Fq "$d 127.0.0.1:1443;" "$LEGACY_STREAM" || \
+     ! docker exec nginx-selfsteal nginx -t; then
+    cp -a "$snapshot/edge.conf" "$LEGACY_STREAM"
+    die 'Не удалось подготовить production-конфиг. Тестовый конфиг восстановлен.'
+  fi
+  if ! docker exec nginx-selfsteal nginx -s reload; then
+    cp -a "$snapshot/edge.conf" "$LEGACY_STREAM"
+    docker exec nginx-selfsteal nginx -s reload >/dev/null 2>&1 || true
+    die 'Reload не выполнился. Конфиг восстановлен, но Xray остаётся на localhost:1443.'
+  fi
+  legacy_record_state "$d" active "$snapshot"
+  ok 'SNI Edge активирован на TCP/443.'
+  info 'Проверь из сети клиента REALITY, браузер с правильным SNI и одновременно несколько подключений.'
+  warn 'Если не работает: открой консоль провайдера, проверь nginx -t, логи и профиль; откат требует координации с Remnawave.'
+}
+legacy_disable(){
+  legacy_require
+  local mode tmp
+  mode="$(legacy_mode)"
+  [[ "$mode" != off ]] || { warn 'SNI Edge не был установлен'; return; }
+  [[ "$mode" == test || "$mode" == active ]] || die 'Неизвестный конфиг, ручная проверка обязательна'
+  if [[ "$mode" == active ]]; then
+    warn 'Отключение SNI Edge освободит публичный 443/TCP. При REALITY на localhost:1443 клиенты потеряют доступ.'
+    yesno 'Отключить активный Edge, понимая необходимость переключить профиль назад?' || return
+  else
+    yesno 'Удалить тестовую конфигурацию SNI Edge?' || return
+  fi
+  tmp="$(mktemp "$BACKUPS/legacy-main.XXXXXXXX")"
+  cp -a "$LEGACY_MAIN" "$tmp"
+  sed -i '/^# BEGIN RWINS LEGACY SNI EDGE$/,/^# END RWINS LEGACY SNI EDGE$/d' "$LEGACY_MAIN"
+  # Cannot delete our stream file before successful config validation: first move aside.
+  mv "$LEGACY_TLS" "$LEGACY_TLS.disabled"
+  mv "$LEGACY_STREAM" "$LEGACY_STREAM.disabled"
+  if ! docker exec nginx-selfsteal nginx -t || ! docker exec nginx-selfsteal nginx -s reload; then
+    cp -a "$tmp" "$LEGACY_MAIN"
+    mv "$LEGACY_TLS.disabled" "$LEGACY_TLS"
+    mv "$LEGACY_STREAM.disabled" "$LEGACY_STREAM"
+    docker exec nginx-selfsteal nginx -s reload >/dev/null 2>&1 || true
+    die 'Удаление не прошло; конфигурация восстановлена'
+  fi
+  rm -f "$LEGACY_TLS.disabled" "$LEGACY_STREAM.disabled" "$LEGACY_STATE"
+  ok 'SNI Edge удалён из старого nginx-selfsteal. Бэкапы сохранены.'
+}
+
+edge_prepare(){
+  if legacy_container_exists; then legacy_prepare; else host_edge_prepare; fi
+}
+edge_activate(){
+  if legacy_container_exists; then legacy_activate; else host_edge_activate; fi
+}
+edge_disable(){
+  if legacy_container_exists; then legacy_disable; else host_edge_disable; fi
+}
+edge_test(){
+  if legacy_container_exists; then legacy_test
+  else
+    warn 'Автотест предусмотрен для старого Docker selfsteal; проверь nginx -t и порты для хостового Nginx.'
+  fi
 }
 
 fw_remove_rules(){
@@ -490,7 +749,12 @@ fw_status(){
 status(){
   printf '\n===== rw-ins %s =====\n' "$VERSION"
   printf 'Версия образа для новых установок: %s\n' "$NODE_IMAGE"
-  printf 'Домен selfsteal: %s\n' "$(cat "$DOMAIN_FILE" 2>/dev/null || echo не настроен)"
+  if legacy_container_exists && [[ -f "$LEGACY_SITE" ]]; then
+    printf 'Домен старого selfsteal: %s\n' "$(legacy_domain)"
+    printf 'Legacy SNI Edge: %s\n' "$(legacy_mode)"
+  else
+    printf 'Домен selfsteal: %s\n' "$(cat "$DOMAIN_FILE" 2>/dev/null || echo не настроен)"
+  fi
   printf 'Nginx edge: '; [[ -f "$EDGE_ACTIVE" ]] && echo включён || echo выключен
   printf 'Unix-сокет: '; [[ -S /dev/shm/nginx.sock ]] && echo OK || echo отсутствует
   printf '\nКонтейнеры:\n'
@@ -539,7 +803,7 @@ menu(){
   ║  1. Установить / проверить RemnaNode                 ║
   ║  2. Настроить Nginx Selfsteal + HTTPS               ║
   ║  3. Сертификаты Hysteria2 / XHTTP                   ║
-  ║  4. Подготовить SNI Edge (не включает)              ║
+  ║  4. Подготовить SNI Edge (авто Docker/host)         ║
   ║  5. Включить SNI Edge на тестовой ноде               ║
   ║  6. Отключить SNI Edge                              ║
   ║  7. Защитить NODE_PORT по IP панели                 ║
@@ -549,6 +813,7 @@ menu(){
   ║ 11. Сгенерировать REALITY shortId                   ║
   ║ 12. Обновить сам rw-ins (по запросу)                ║
   ║ 13. Проверить WARP (без изменений)                 ║
+  ║ 14. Проверить SNI Edge (без изменений)             ║
   ║  0. Выход                                           ║
   ╚════════════════════════════════════════════════════╝
 MENU
@@ -567,6 +832,7 @@ MENU
       11) generate_sid ;;
       12) update_cli ;;
       13) warp_status ;;
+      14) edge_test ;;
       0|q|Q) return ;;
       *) warn 'Неизвестный пункт' ;;
     esac
@@ -577,6 +843,7 @@ usage(){
 rw-ins $VERSION
   menu               Interactive menu. Initial launch installs local CLI + Docker and offers RemnaNode setup.
   status             Show server status (read-only).
+  edge-test          Test legacy SNI Edge routing from localhost.
   firewall-reapply   Non-interactive: restore configured NODE_PORT firewall rules (systemd service).
   self-install       Save this running script as /usr/local/bin/rw-ins.
   --version          Print version.
@@ -586,7 +853,7 @@ First run from GitHub:
 After that:
   sudo rw-ins
 
-Existing nodes are NOT overwritten. A staging SNI edge requires a dedicated temporary Config Profile.
+Existing nodes are NOT overwritten. Legacy Docker selfsteal is extended safely on loopback. Production cutover requires a temporary Config Profile on the selected node.
 USAGE
 }
 main(){
@@ -609,6 +876,7 @@ main(){
       menu
       ;;
     status) status ;;
+    edge-test) edge_test ;;
     firewall-reapply) fw_reapply ;;
     self-install) install_self ;;
     --version) printf '%s\n' "$VERSION" ;;
