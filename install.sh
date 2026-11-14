@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# rw-ins — single-file RemnaNode maintenance CLI, preview 0.3.1
+# rw-ins — single-file RemnaNode maintenance CLI, preview 0.3.2
 # Ubuntu/Debian, bash 4.4+, systemd. Does not execute third-party Bash installers.
 set -Eeuo pipefail
 umask 077
 
-VERSION='0.3.1-preview'
+VERSION='0.3.2-preview'
 SELF='/usr/local/bin/rw-ins'
 SELF_URL='https://raw.githubusercontent.com/KinG123124/remnanode-installer/refs/heads/main/install.sh'
 STATE='/etc/rw-ins'
@@ -391,10 +391,18 @@ host_edge_prepare(){
   [[ -s "$DOMAIN_FILE" ]] || die 'Сначала настрой selfsteal'
   [[ -S /dev/shm/nginx.sock ]] || die 'Unix-сокет selfsteal отсутствует'
   [[ ! -f "$EDGE_ACTIVE" ]] || die 'SNI edge уже активен'
-  local d; d="$(cat "$DOMAIN_FILE")"
+  # Do not touch a non-rw-ins stream config and never overwrite custom staging.
+  if [[ -e "$EDGE_FILE" ]]; then
+    grep -Fq '# Created by rw-ins.' "$EDGE_FILE" || die "Неизвестный staging-файл: $EDGE_FILE"
+  fi
+  nginx -t || die 'Основная конфигурация Nginx уже содержит ошибку; SNI Edge не изменяю'
+  local d tmp staged
+  d="$(cat "$DOMAIN_FILE")"
+  valid_domain "$d" || die "Некорректный домен в $DOMAIN_FILE"
   mkdir -p /etc/nginx
-  cat > "$EDGE_FILE" <<NG
-# Created by rw-ins. Deliberately staged; not active until edge-activate.
+  staged="$(mktemp /etc/nginx/rwins-edge-staging.XXXXXXXX)"
+  cat > "$staged" <<NG
+# Created by rw-ins. Deliberately staged; not loaded until edge-activate.
 stream {
   map \$ssl_preread_server_name \$rwins_backend {
     $d 127.0.0.1:1443;
@@ -412,50 +420,77 @@ stream {
   }
 }
 NG
-  chmod 644 "$EDGE_FILE"
-  # Validate syntax with temp main config; stream module is loaded by nginx.conf.
-  local tmp; tmp="$(mktemp /etc/nginx/rwins-test.XXXXXX)"
-  printf 'include /etc/nginx/nginx.conf;\ninclude %s;\n' "$EDGE_FILE" > "$tmp"
-  nginx -p /etc/nginx -c "$tmp" -t
+  chmod 644 "$staged"
+  # Preserve nginx's compiled prefix (/usr/share/nginx on Ubuntu).
+  # -p /etc/nginx incorrectly resolves dynamic modules under /etc/nginx/modules.
+  tmp="$(mktemp /etc/nginx/rwins-test.XXXXXXXX)"
+  printf 'include /etc/nginx/nginx.conf;\ninclude %s;\n' "$staged" > "$tmp"
+  if ! nginx -c "$tmp" -t; then
+    rm -f "$tmp" "$staged"
+    die 'Проверка staging SNI Edge не пройдена. Основной nginx.conf не изменялся.'
+  fi
   rm -f "$tmp"
-  ok "Подготовлен: $EDGE_FILE"
-  warn 'Для тестовой ноды REALITY должен слушать 127.0.0.1:1443, а не 0.0.0.0:443.'
-  warn 'Если используешь один Config Profile на всех нодах — сделай временный тестовый профиль. Не переключай всех одновременно.'
+  if [[ -e "$EDGE_FILE" ]]; then backup "$EDGE_FILE"; fi
+  mv -f "$staged" "$EDGE_FILE"
+  ok "SNI Edge подготовлен: $EDGE_FILE"
+  info 'Пункт 4 проверяет только синтаксис, не перенастраивает рабочий TCP/443.'
+  warn 'Для включения REALITY должен слушать 127.0.0.1:1443, а не 0.0.0.0:443.'
+  warn 'При одном Config Profile на нескольких нодах используй отдельный временный профиль.'
 }
 host_edge_activate(){
-  [[ -s "$EDGE_FILE" ]] || die 'Сначала выбери Подготовить SNI edge'
-  [[ ! -e "$EDGE_ACTIVE" ]] || die 'SNI edge уже активен'
-  local x;
+  [[ -s "$EDGE_FILE" ]] || die 'Сначала выбери Подготовить SNI Edge'
+  [[ ! -e "$EDGE_ACTIVE" ]] || die 'SNI Edge уже активен'
+  local x
   x="$(ss -H -lnt '( sport = :1443 )' | awk '{print $4}')"
   grep -Fxq '127.0.0.1:1443' <<< "$x" || die 'Нет Xray на 127.0.0.1:1443. Сначала переключи тестовый профиль.'
+  ss -H -lnt '( sport = :9443 )' | grep -q . || die 'HTTPS fallback 127.0.0.1:9443 не слушает'
   if ss -H -lnt '( sport = :443 )' | grep -q .; then
     ss -H -lntp '( sport = :443 )'
     die '443/TCP занят. Сначала освободи порт от старого Xray.'
   fi
+  nginx -t || die 'Текущая конфигурация Nginx невалидна, изменений не вношу'
   yesno 'Активировать Nginx на 443/TCP?' || return
-  if grep -Fq 'include /etc/nginx/rw-ins-edge.conf;' /etc/nginx/nginx.conf; then
-    :
-  else
-    backup /etc/nginx/nginx.conf
+  local snapshot
+  snapshot="$(mktemp "$BACKUPS/nginx-main-before-edge.XXXXXXXX")"
+  cp -a /etc/nginx/nginx.conf "$snapshot"
+  if ! grep -Fxq 'include /etc/nginx/rw-ins-edge.conf;' /etc/nginx/nginx.conf; then
     printf '\n# rw-ins SNI edge, top-level stream context\ninclude /etc/nginx/rw-ins-edge.conf;\n' >> /etc/nginx/nginx.conf
   fi
   cp "$EDGE_FILE" "$EDGE_ACTIVE"
   if ! nginx -t || ! systemctl reload nginx; then
+    # Full rollback must restore BOTH nginx.conf and the edge file.
+    cp -a "$snapshot" /etc/nginx/nginx.conf
     rm -f "$EDGE_ACTIVE"
-    nginx -t && systemctl reload nginx || true
-    die 'Не удалось включить SNI edge; конфиг отключён. Проверь состояние порта 443.'
+    if nginx -t; then
+      systemctl reload nginx || warn 'Не удалось восстановить Nginx reload, проверь systemctl status nginx'
+    else
+      warn 'После отката nginx -t не прошёл — проверь конфигурацию вручную'
+    fi
+    die 'Активация не удалась, основной конфиг восстановлен из резервной копии'
   fi
-  ok 'SNI edge включён. Свой SNI → REALITY localhost:1443; чужие SNI → обычный HTTPS localhost:9443.'
-  warn 'Это не гарантирует защиту от IP-блокировок. Проверь параллельные подключения и fallback перед развёртыванием на других нодах.'
+  ok 'SNI Edge включён. Свой SNI → REALITY localhost:1443; чужие SNI → обычный HTTPS localhost:9443.'
+  warn 'Проверь клиентское REALITY-подключение, fallback и параллельные соединения.'
 }
 host_edge_disable(){
-  [[ -e "$EDGE_ACTIVE" ]] || { warn 'SNI edge не включён'; return; }
-  warn 'Xray по-прежнему будет слушать только localhost:1443, и внешний VPN пропадёт после отключения Nginx edge.'
-  yesno 'Отключить SNI edge? Используй консоль провайдера или подготовь возврат Xray в профиль.' || return
-  backup "$EDGE_ACTIVE"
+  [[ -e "$EDGE_ACTIVE" ]] || { warn 'SNI Edge не включён'; return; }
+  warn 'Xray останется на localhost:1443: после отключения Edge внешний TCP/443 станет недоступен.'
+  yesno 'Отключить SNI Edge? При необходимости верни публичный Xray в профиле.' || return
+  nginx -t || die 'Текущий Nginx невалиден: автоматическое отключение небезопасно'
+  local snapshot edge_snapshot
+  snapshot="$(mktemp "$BACKUPS/nginx-main-disable.XXXXXXXX")"
+  edge_snapshot="$(mktemp "$BACKUPS/nginx-edge-disable.XXXXXXXX")"
+  cp -a /etc/nginx/nginx.conf "$snapshot"
+  cp -a "$EDGE_ACTIVE" "$edge_snapshot"
+  sed -i -e '/^# rw-ins SNI edge, top-level stream context$/d' \
+         -e '/^include \/etc\/nginx\/rw-ins-edge\.conf;$/d' /etc/nginx/nginx.conf
   rm -f "$EDGE_ACTIVE"
-  nginx -t && systemctl reload nginx || die 'Не удалось перезагрузить Nginx'
-  ok 'SNI edge отключён. Верни публичный Xray listener только после проверки.'
+  if ! nginx -t || ! systemctl reload nginx; then
+    cp -a "$snapshot" /etc/nginx/nginx.conf
+    cp -a "$edge_snapshot" "$EDGE_ACTIVE"
+    if nginx -t; then systemctl reload nginx || true; fi
+    die 'Отключение не удалось: конфигурация восстановлена'
+  fi
+  ok 'SNI Edge отключён. Публичный REALITY необходимо восстановить через профиль Remnawave.'
 }
 
 # ---------------- Existing Docker-based selfsteal migration ----------------
